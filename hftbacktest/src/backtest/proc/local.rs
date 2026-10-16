@@ -1,3 +1,4 @@
+use crate::backtest::execution::{ExecutionConsumer, failure};
 use std::collections::{HashMap, hash_map::Entry};
 
 use crate::{
@@ -39,6 +40,7 @@ where
     MD: MarketDepth,
     FM: FeeModel,
 {
+    execution_consumer: Option<Box<dyn ExecutionConsumer>>,
     orders: HashMap<OrderId, Order>,
     order_l2e: LocalToExch<LM>,
     depth: MD,
@@ -63,6 +65,7 @@ where
         order_l2e: LocalToExch<LM>,
     ) -> Self {
         Self {
+            execution_consumer: None,
             orders: Default::default(),
             order_l2e,
             depth,
@@ -71,6 +74,11 @@ where
             last_feed_latency: None,
             last_order_latency: None,
         }
+    }
+
+    pub fn with_execution_consumer(mut self, consumer: Box<dyn ExecutionConsumer>) -> Self {
+        self.execution_consumer = Some(consumer);
+        self
     }
 
     pub fn process_recv_order_<const USE_HANDLER: bool, Handler>(
@@ -83,7 +91,15 @@ where
         Handler: FnMut(&Order),
     {
         let mut wait_resp_order_received = false;
-        while let Some(order) = self.order_l2e.receive(timestamp) {
+        while let Some((order, envelope)) = self.order_l2e.receive_envelope(timestamp) {
+            let extended = envelope.is_some();
+            match (&mut self.execution_consumer, envelope.as_ref()) {
+                (Some(consumer), Some(envelope)) => {
+                    consumer.received(&order, envelope, timestamp)?
+                }
+                (None, None) => {}
+                _ => return Err(failure("execution_mode_mismatch")),
+            }
             // Updates the order latency only if it has a valid exchange timestamp. When the
             // order is rejected before it reaches the matching engine, it has no exchange
             // timestamp. This situation occurs in crypto exchanges.
@@ -99,7 +115,7 @@ where
             }
 
             // Processes receiving order response.
-            if order.status == Status::Filled {
+            if !extended && order.status == Status::Filled {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.

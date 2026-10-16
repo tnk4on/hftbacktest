@@ -17,22 +17,10 @@ use crate::{
     depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, MarketDepth},
     prelude::OrdType,
     types::{
-        EXCH_ASK_DEPTH_CLEAR_EVENT,
-        EXCH_ASK_DEPTH_EVENT,
-        EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BID_DEPTH_CLEAR_EVENT,
-        EXCH_BID_DEPTH_EVENT,
-        EXCH_BID_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BUY_TRADE_EVENT,
-        EXCH_DEPTH_CLEAR_EVENT,
-        EXCH_EVENT,
-        EXCH_SELL_TRADE_EVENT,
-        Event,
-        Order,
-        OrderId,
-        Side,
-        Status,
-        TimeInForce,
+        EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+        EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT,
+        EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event,
+        Order, OrderId, Side, Status, TimeInForce,
     },
 };
 
@@ -220,6 +208,8 @@ where
             return Err(BacktestError::InvalidOrderStatus);
         }
 
+        self.order_e2l.prepare_execution(order, exec_qty)?;
+        let leaves_before = order.leaves_qty;
         order.maker = maker;
         if maker {
             order.exec_price_tick = order.price_tick;
@@ -237,9 +227,10 @@ where
         order.exch_timestamp = timestamp;
 
         self.state.apply_fill(order);
+        self.order_e2l.record_execution(order, leaves_before)?;
 
         if MAKE_RESPONSE {
-            self.order_e2l.respond(order.clone());
+            self.order_e2l.respond_checked(order.clone())?;
         }
         Ok(())
     }
@@ -844,7 +835,7 @@ where
                 return Err(BacktestError::InvalidOrderRequest);
             }
             // Makes the response.
-            self.order_e2l.respond(order);
+            self.order_e2l.respond_checked(order)?;
         }
         Ok(false)
     }

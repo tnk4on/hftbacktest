@@ -1,12 +1,19 @@
 use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc};
 
-use crate::{backtest::models::LatencyModel, types::Order};
+use crate::{
+    backtest::{
+        BacktestError,
+        execution::{Execution, ExecutionObserver, ExecutionStream, ResponseEnvelope, failure},
+        models::LatencyModel,
+    },
+    types::Order,
+};
 
 /// Provides a bus for transporting backtesting orders between the exchange and the local model
 /// based on the given timestamp.
 #[derive(Clone, Debug, Default)]
 pub struct OrderBus {
-    order_list: Rc<UnsafeCell<VecDeque<(Order, i64)>>>,
+    order_list: Rc<UnsafeCell<VecDeque<(Order, i64, Option<ResponseEnvelope>)>>>,
 }
 
 impl OrderBus {
@@ -19,7 +26,7 @@ impl OrderBus {
     pub fn earliest_timestamp(&self) -> Option<i64> {
         unsafe { &*self.order_list.get() }
             .front()
-            .map(|(_order, ts)| *ts)
+            .map(|(_order, ts, _)| *ts)
     }
 
     /// Appends the order to the bus with the timestamp.
@@ -32,18 +39,28 @@ impl OrderBus {
     /// purpose of simplifying the backtesting process, all requests and responses are assumed to be
     /// in order.
     pub fn append(&mut self, order: Order, timestamp: i64) {
+        self.append_envelope(order, timestamp, None);
+    }
+
+    fn append_envelope(
+        &mut self,
+        order: Order,
+        timestamp: i64,
+        envelope: Option<ResponseEnvelope>,
+    ) -> i64 {
         let latest_timestamp = {
             let order_list = unsafe { &*self.order_list.get() };
             let len = order_list.len();
             if len > 0 {
-                let (_, timestamp) = order_list.get(len - 1).unwrap();
+                let (_, timestamp, _) = order_list.get(len - 1).unwrap();
                 *timestamp
             } else {
                 0
             }
         };
         let timestamp = timestamp.max(latest_timestamp);
-        unsafe { &mut *self.order_list.get() }.push_back((order, timestamp));
+        unsafe { &mut *self.order_list.get() }.push_back((order, timestamp, envelope));
+        timestamp
     }
 
     /// Resets this to clear it.
@@ -63,7 +80,9 @@ impl OrderBus {
 
     /// Removes the first order and its timestamp and returns it, or ``None`` if the bus is empty.
     pub fn pop_front(&mut self) -> Option<(Order, i64)> {
-        unsafe { &mut *self.order_list.get() }.pop_front()
+        unsafe { &mut *self.order_list.get() }
+            .pop_front()
+            .map(|(o, t, _)| (o, t))
     }
 }
 
@@ -72,12 +91,98 @@ pub struct ExchToLocal<LM> {
     to_exch: OrderBus,
     to_local: OrderBus,
     order_latency: LM,
+    execution: Option<ExecutionStream>,
 }
 
 impl<LM> ExchToLocal<LM>
 where
     LM: LatencyModel,
 {
+    pub fn with_execution_observer(
+        mut self,
+        run: u64,
+        asset: usize,
+        observer: Box<dyn ExecutionObserver>,
+    ) -> Self {
+        self.execution = Some(ExecutionStream {
+            run,
+            asset,
+            next_execution: 1,
+            next_response: 1,
+            pending: Vec::with_capacity(16),
+            observer,
+        });
+        self
+    }
+
+    pub(crate) fn prepare_execution(&self, order: &Order, qty: f64) -> Result<(), BacktestError> {
+        if let Some(stream) = &self.execution {
+            if stream.pending.len() >= 16
+                || stream.next_execution > 16
+                || !qty.is_finite()
+                || qty <= 0.0
+                || !order.leaves_qty.is_finite()
+                || qty > order.leaves_qty
+            {
+                return Err(failure("execution_capacity_or_quantity"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_execution(
+        &mut self,
+        order: &Order,
+        leaves_before: f64,
+    ) -> Result<(), BacktestError> {
+        if let Some(stream) = &mut self.execution {
+            let execution = Execution {
+                run: stream.run,
+                asset: stream.asset,
+                order_id: order.order_id,
+                generation: 1,
+                revision: 1,
+                execution_id: stream.next_execution,
+                side: order.side,
+                qty: order.exec_qty,
+                price_tick: order.exec_price_tick,
+                tick_size: order.tick_size,
+                maker: order.maker,
+                exchange_timestamp: order.exch_timestamp,
+                leaves_before,
+                leaves_after: order.leaves_qty,
+            };
+            stream.next_execution += 1;
+            stream.pending.push(execution.clone());
+            stream.observer.generated(&execution)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn respond_checked(&mut self, order: Order) -> Result<(), BacktestError> {
+        if self.execution.is_none() {
+            self.respond(order);
+            return Ok(());
+        }
+        let stream = self.execution.as_mut().unwrap();
+        if stream.next_response > 32 || stream.pending.iter().any(|e| e.order_id != order.order_id)
+        {
+            return Err(failure("response_capacity_or_order"));
+        }
+        let envelope = ResponseEnvelope {
+            response_id: stream.next_response,
+            executions: stream.pending.clone(),
+        };
+        let arrival =
+            order.exch_timestamp + self.order_latency.response(order.exch_timestamp, &order);
+        let actual = self
+            .to_local
+            .append_envelope(order.clone(), arrival, Some(envelope.clone()));
+        stream.next_response += 1;
+        stream.pending.clear();
+        stream.observer.registered(&order, &envelope, actual)
+    }
+
     /// Returns the timestamp of the earliest order to be received by the exchange from the local.
     pub fn earliest_recv_order_timestamp(&self) -> Option<i64> {
         self.to_exch.earliest_timestamp()
@@ -155,6 +260,21 @@ where
         }
     }
 
+    pub(crate) fn receive_envelope(
+        &mut self,
+        receipt_timestamp: i64,
+    ) -> Option<(Order, Option<ResponseEnvelope>)> {
+        if let Some(timestamp) = self.to_local.earliest_timestamp() {
+            if timestamp == receipt_timestamp {
+                return unsafe { &mut *self.to_local.order_list.get() }
+                    .pop_front()
+                    .map(|(o, _, e)| (o, e));
+            }
+            assert!(timestamp > receipt_timestamp);
+        }
+        None
+    }
+
     /// Receives the order response from the exchange, which is expected to be received at
     /// `receipt_timestamp`.
     pub fn receive(&mut self, receipt_timestamp: i64) -> Option<Order> {
@@ -183,6 +303,7 @@ where
             to_exch: to_exch.clone(),
             to_local: to_local.clone(),
             order_latency: order_latency.clone(),
+            execution: None,
         },
         LocalToExch {
             to_exch,
