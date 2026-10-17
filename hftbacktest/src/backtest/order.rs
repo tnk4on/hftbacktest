@@ -3,7 +3,7 @@ use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc};
 use crate::{
     backtest::{
         BacktestError,
-        execution::{Execution, ExecutionObserver, ExecutionStream, ResponseEnvelope, failure},
+        execution::{Execution, ExecutionLimits, ExecutionObserver, ExecutionStream, ResponseEnvelope, failure},
         models::LatencyModel,
     },
     types::Order,
@@ -110,16 +110,26 @@ where
             next_execution: 1,
             next_response: 1,
             pending: Vec::with_capacity(16),
+            limits: ExecutionLimits::default(),
             observer,
         });
         self
     }
 
+    /// Opt-in cumulative budgets; matching, delivery timestamps and the consumer are unchanged.
+    pub fn with_execution_observer_limits(
+        mut self, run: u64, asset: usize, observer: Box<dyn ExecutionObserver>, limits: ExecutionLimits,
+    ) -> Result<Self, BacktestError> {
+        limits.validate()?;
+        self.execution = Some(ExecutionStream { run, asset, next_execution: 1, next_response: 1,
+            pending: Vec::with_capacity(limits.pending_executions), observer, limits });
+        Ok(self)
+    }
+
     pub(crate) fn prepare_execution(&self, order: &Order, qty: f64) -> Result<(), BacktestError> {
         if let Some(stream) = &self.execution {
-            if stream.pending.len() >= 16
-                || stream.next_execution > 16
-                || !qty.is_finite()
+            stream.limits.admit_execution(stream.next_execution, stream.pending.len())?;
+            if !qty.is_finite()
                 || qty <= 0.0
                 || !order.leaves_qty.is_finite()
                 || qty > order.leaves_qty
@@ -152,7 +162,7 @@ where
                 leaves_before,
                 leaves_after: order.leaves_qty,
             };
-            stream.next_execution += 1;
+            stream.next_execution = stream.next_execution.checked_add(1).ok_or_else(|| failure("execution_id_overflow"))?;
             stream.pending.push(execution.clone());
             stream.observer.generated(&execution)?;
         }
@@ -165,7 +175,8 @@ where
             return Ok(());
         }
         let stream = self.execution.as_mut().unwrap();
-        if stream.next_response > 32 || stream.pending.iter().any(|e| e.order_id != order.order_id)
+        stream.limits.admit_response(stream.next_response, self.to_local.len())?;
+        if stream.pending.iter().any(|e| e.order_id != order.order_id)
         {
             return Err(failure("response_capacity_or_order"));
         }
@@ -178,7 +189,7 @@ where
         let actual = self
             .to_local
             .append_envelope(order.clone(), arrival, Some(envelope.clone()));
-        stream.next_response += 1;
+        stream.next_response = stream.next_response.checked_add(1).ok_or_else(|| failure("response_id_overflow"))?;
         stream.pending.clear();
         stream.observer.registered(&order, &envelope, actual)
     }
